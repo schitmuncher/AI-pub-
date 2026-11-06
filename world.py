@@ -20,6 +20,10 @@ import sys
 
 from news import unseen_today
 import memory as mem
+import llm
+
+USE_SCENES = False  # set in main() when a model is configured
+SCENE_CAST_LIMIT = 6
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "state.json")
@@ -454,6 +458,32 @@ def landlord_turn(state, brain):
 
 # ---------- the hour and the day ----------
 
+def run_scene_hour(state, present):
+    """One batched model call for the room. Returns False if it could not run,
+    so the caller can fall back to the rules-based talk."""
+    people = present[:SCENE_CAST_LIMIT]
+    topic = state.get("topic") or "the football"
+    for p in people:
+        p["mood"] = mood_of(p)
+        p["recalled"] = [m["text"] for m in mem.retrieve(p, state["day"], query=topic, k=3)]
+    hour_events = [t for d, h, t in EVENTS if d == state["day"] and h == state["hour"]][-8:]
+    try:
+        out = llm.run_scene(state, people, hour_events)
+    except llm.LLMError as e:
+        state["landlord_memory"] = (state["landlord_memory"] + [f"scene skipped: {e}"])[-20:]
+        return False
+    if not out["lines"]:
+        return False
+    by_name = {p["name"]: p for p in people}
+    for ln in out["lines"]:
+        say(state, f'{ln["name"]}: "{ln["says"]}"')
+        remember(by_name[ln["name"]], state, f"said something about {topic}", importance=1)
+    for m in out["memories"]:
+        remember(by_name[m["name"]], state, m["text"], importance=m["importance"],
+                 about=m["about"], rel=m["rel"])
+    return True
+
+
 def run_hour(state, rng, hour, brain):
     state["hour"] = hour
     if hour == 12:
@@ -477,7 +507,10 @@ def run_hour(state, rng, hour, brain):
     for p in present:
         if p["role"] != "staff" and rng.random() < 0.9:
             serve(state, p)
-        speak(state, p, rng, present)
+    spoke = USE_SCENES and len(present) >= 2 and run_scene_hour(state, present)
+    if not spoke:
+        for p in present:
+            speak(state, p, rng, present)
     gossip(state, present, rng)
     secret_moves(state, present, rng)
     if hour in DECISION_HOURS:
@@ -580,7 +613,12 @@ def main():
     else:
         state = new_state()
 
-    brain = TemplateBrain()
+    global USE_SCENES
+    model_on = bool(os.environ.get("SALT_LLM"))
+    USE_SCENES = model_on
+    brain = llm.LLMBrain(TemplateBrain()) if model_on else TemplateBrain()
+    print(f"Mode: {'model (' + os.environ['SALT_LLM'] + ')' if model_on else 'rules only'}; "
+          f"model calls left today: {llm.budget_left() if model_on else 'n/a'}")
     last_path = None
     for _ in range(days):
         EVENTS.clear()
